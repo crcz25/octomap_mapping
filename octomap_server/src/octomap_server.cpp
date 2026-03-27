@@ -29,6 +29,7 @@
 #include <octomap_server/octomap_server.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <memory>
 #include <string>
@@ -300,7 +301,16 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   map_pub_ = create_publisher<OccupancyGrid>("projected_map", qos.keep_last(5));
   fmarker_pub_ = create_publisher<MarkerArray>("free_cells_vis_array", qos);
 
-  tf2_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
+  double tf_cache_time_sec = declare_parameter("tf_cache_time_sec", 30.0);
+  if (tf_cache_time_sec <= 0.0) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Invalid tf_cache_time_sec=%f, using 30.0 seconds.", tf_cache_time_sec);
+    tf_cache_time_sec = 30.0;
+  }
+  const auto tf_cache_time = std::chrono::duration_cast<tf2::Duration>(
+    std::chrono::duration<double>(tf_cache_time_sec));
+  tf2_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock(), tf_cache_time);
   auto timer_interface = std::make_shared<tf2_ros::CreateTimerROS>(
     this->get_node_base_interface(),
     this->get_node_timers_interface());
@@ -309,14 +319,40 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
     std::make_shared<tf2_ros::TransformListener>(*tf2_buffer_);
 
   using std::chrono_literals::operator""s;
+  int queue_size = declare_parameter("queue_size", 5);
+  if (queue_size < 1) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Invalid queue_size=%d for point cloud filtering, using 1 instead.", queue_size);
+    queue_size = 1;
+  }
+  int cloud_sub_qos_depth = declare_parameter("cloud_sub_qos_depth", 5);
+  if (cloud_sub_qos_depth < 1) {
+    RCLCPP_WARN(
+      get_logger(),
+      "Invalid cloud_sub_qos_depth=%d, using 1 instead.", cloud_sub_qos_depth);
+    cloud_sub_qos_depth = 1;
+  }
 #ifdef USE_OLD_RMW_QOS_MESSAGE_FILTERS
   point_cloud_sub_.subscribe(this, "cloud_in", rmw_qos_profile_sensor_data);
 #else
-  point_cloud_sub_.subscribe(this, "cloud_in", rclcpp::SensorDataQoS());
+  auto sensor_qos =
+    rclcpp::SensorDataQoS().keep_last(static_cast<size_t>(cloud_sub_qos_depth));
+  point_cloud_sub_.subscribe(this, "cloud_in", sensor_qos);
 #endif
   tf_point_cloud_sub_ = std::make_shared<tf2_ros::MessageFilter<PointCloud2>>(
-    point_cloud_sub_, *tf2_buffer_, world_frame_id_, 5, this->get_node_logging_interface(),
+    point_cloud_sub_, *tf2_buffer_, world_frame_id_, static_cast<uint32_t>(queue_size),
+    this->get_node_logging_interface(),
     this->get_node_clock_interface(), 5s);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Subscribing to cloud_in with SensorDataQoS depth=%d and TF message filter queue_size=%d",
+    cloud_sub_qos_depth, queue_size);
+  RCLCPP_INFO(
+    get_logger(),
+    "Using TF buffer cache duration of %.3f seconds",
+    tf_cache_time_sec);
 
   tf_point_cloud_sub_->registerCallback(&OctomapServer::insertCloudCallback, this);
 
