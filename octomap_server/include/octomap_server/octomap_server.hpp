@@ -89,6 +89,8 @@ using sensor_msgs::msg::PointCloud2;
 using std_msgs::msg::ColorRGBA;
 using visualization_msgs::msg::MarkerArray;
 
+class RuntimeProfiler;
+
 class OctomapServer : public rclcpp::Node
 {
 public:
@@ -106,6 +108,7 @@ public:
   using ResetSrv = std_srvs::srv::Empty;
 
   explicit OctomapServer(const rclcpp::NodeOptions & node_options);
+  ~OctomapServer() override;
   virtual bool onOctomapBinarySrv(
     const std::shared_ptr<OctomapSrv::Request> req,
     const std::shared_ptr<OctomapSrv::Response> res);
@@ -306,6 +309,7 @@ protected:
   unsigned multires_2d_scale_;
   bool project_complete_map_;
   bool use_colored_map_;
+  std::unique_ptr<RuntimeProfiler> profiler_;
 };
 }  // namespace octomap_server
 

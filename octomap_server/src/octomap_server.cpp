@@ -30,9 +30,18 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <sys/stat.h>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include <tf2_eigen/tf2_eigen.hpp>
@@ -56,6 +65,214 @@ bool update_param(const std::vector<rclcpp::Parameter> & p, const std::string & 
 }  // namespace
 namespace octomap_server
 {
+class RuntimeProfiler
+{
+public:
+  RuntimeProfiler(
+    const std::string & node_name, const std::string & package_name,
+    const std::string & file_tag, bool enabled, const std::string & output_path,
+    const std::string & run_name, bool save_on_shutdown, int discard_first_n)
+  : node_name_(node_name), package_name_(package_name), file_tag_(file_tag),
+    enabled_(enabled), output_path_(output_path), run_name_(run_name),
+    save_on_shutdown_(save_on_shutdown), discard_first_n_(std::max(0, discard_first_n)),
+    started_at_(timestamp())
+  {}
+
+  ~RuntimeProfiler()
+  {
+    if (save_on_shutdown_) {
+      save();
+    }
+  }
+
+  void record(const std::string & stage_name, double elapsed_ms)
+  {
+    if (!enabled_ || !std::isfinite(elapsed_ms)) {
+      return;
+    }
+    samples_[stage_name].push_back(elapsed_ms);
+  }
+
+  void save()
+  {
+    if (!enabled_ || saved_) {
+      return;
+    }
+    const std::string base_path = output_path_.empty() ? "." : output_path_;
+    makeDirectories(base_path);
+    const std::string path = base_path + "/" + run_name_ + "." + file_tag_ + ".json";
+    std::ofstream out(path);
+    if (!out) {
+      return;
+    }
+    ended_at_ = timestamp();
+    out << "{\n";
+    out << "  \"run_name\": " << jsonString(run_name_) << ",\n";
+    out << "  \"node_name\": " << jsonString(node_name_) << ",\n";
+    out << "  \"package_name\": " << jsonString(package_name_) << ",\n";
+    out << "  \"discarded_warmup_count\": " << discard_first_n_ << ",\n";
+    out << "  \"started_at\": " << jsonString(started_at_) << ",\n";
+    out << "  \"ended_at\": " << jsonString(ended_at_) << ",\n";
+    out << "  \"metadata\": " << metadataJson() << ",\n";
+    out << "  \"stages\": {\n";
+    size_t stage_index = 0;
+    for (const auto & entry : samples_) {
+      out << "    " << jsonString(entry.first) << ": {\n";
+      out << "      \"samples_ms\": [";
+      for (size_t i = 0; i < entry.second.size(); ++i) {
+        if (i > 0) {
+          out << ", ";
+        }
+        out << std::fixed << std::setprecision(6) << entry.second[i];
+      }
+      out << "],\n";
+      out << "      \"summary\": " << summaryJson(entry.second) << "\n";
+      out << "    }" << (++stage_index < samples_.size() ? "," : "") << "\n";
+    }
+    out << "  }\n";
+    out << "}\n";
+    saved_ = true;
+  }
+
+private:
+  static std::string timestamp()
+  {
+    const auto now = std::time(nullptr);
+    std::tm tm {};
+    gmtime_r(&now, &tm);
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return std::string(buffer);
+  }
+
+  static std::string jsonString(const std::string & value)
+  {
+    std::ostringstream out;
+    out << '"';
+    for (const char c : value) {
+      switch (c) {
+        case '"': out << "\\\""; break;
+        case '\\': out << "\\\\"; break;
+        case '\n': out << "\\n"; break;
+        case '\r': out << "\\r"; break;
+        case '\t': out << "\\t"; break;
+        default: out << c; break;
+      }
+    }
+    out << '"';
+    return out.str();
+  }
+
+  static void makeDirectories(const std::string & path)
+  {
+    if (path.empty()) {
+      return;
+    }
+    std::string current;
+    for (const char c : path) {
+      current.push_back(c);
+      if (c == '/' && current.size() > 1) {
+        mkdir(current.c_str(), 0755);
+      }
+    }
+    mkdir(path.c_str(), 0755);
+  }
+
+  static std::string firstCpuModel()
+  {
+    std::ifstream in("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(in, line)) {
+      const std::string key = "model name";
+      if (line.compare(0, key.size(), key) == 0) {
+        const auto pos = line.find(':');
+        if (pos != std::string::npos) {
+          return line.substr(pos + 2);
+        }
+      }
+    }
+    return "";
+  }
+
+  static double ramGb()
+  {
+    std::ifstream in("/proc/meminfo");
+    std::string key;
+    std::string unit;
+    double kb = 0.0;
+    while (in >> key >> kb >> unit) {
+      if (key == "MemTotal:") {
+        return kb / (1024.0 * 1024.0);
+      }
+    }
+    return 0.0;
+  }
+
+  std::string metadataJson() const
+  {
+    char hostname[256] = "";
+    gethostname(hostname, sizeof(hostname) - 1);
+    const char * ros_distro = std::getenv("ROS_DISTRO");
+    std::ostringstream out;
+    out << "{";
+    out << "\"hostname\": " << jsonString(hostname) << ", ";
+    out << "\"cpu_model\": " << jsonString(firstCpuModel()) << ", ";
+    out << "\"logical_cores\": " << std::thread::hardware_concurrency() << ", ";
+    out << "\"ram_gb\": " << std::fixed << std::setprecision(3) << ramGb() << ", ";
+    out << "\"ros_distro\": " << jsonString(ros_distro ? ros_distro : "") << ", ";
+    out << "\"date_time\": " << jsonString(timestamp()) << ", ";
+    out << "\"occupancy_integration_definition\": " << jsonString("insertScan only");
+    out << "}";
+    return out.str();
+  }
+
+  std::string summaryJson(const std::vector<double> & raw_values) const
+  {
+    std::vector<double> values;
+    for (size_t i = static_cast<size_t>(discard_first_n_); i < raw_values.size(); ++i) {
+      values.push_back(raw_values[i]);
+    }
+    if (values.empty()) {
+      return "{\"n\": 0, \"mean_ms\": null, \"std_ms\": null, \"min_ms\": null, \"max_ms\": null}";
+    }
+    double sum = 0.0;
+    double min_value = values.front();
+    double max_value = values.front();
+    for (const double value : values) {
+      sum += value;
+      min_value = std::min(min_value, value);
+      max_value = std::max(max_value, value);
+    }
+    const double mean = sum / static_cast<double>(values.size());
+    double variance = 0.0;
+    for (const double value : values) {
+      variance += (value - mean) * (value - mean);
+    }
+    variance /= static_cast<double>(values.size());
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(6)
+        << "{\"n\": " << values.size()
+        << ", \"mean_ms\": " << mean
+        << ", \"std_ms\": " << std::sqrt(std::max(0.0, variance))
+        << ", \"min_ms\": " << min_value
+        << ", \"max_ms\": " << max_value << "}";
+    return out.str();
+  }
+
+  std::string node_name_;
+  std::string package_name_;
+  std::string file_tag_;
+  bool enabled_ {false};
+  std::string output_path_;
+  std::string run_name_;
+  bool save_on_shutdown_ {true};
+  int discard_first_n_ {0};
+  std::string started_at_;
+  std::string ended_at_;
+  bool saved_ {false};
+  std::map<std::string, std::vector<double>> samples_;
+};
+
 OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
 : Node("octomap_server", node_options)
 {
@@ -67,6 +284,19 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   use_height_map_ = declare_parameter("use_height_map", false);
   use_colored_map_ = declare_parameter("colored_map", false);
   color_factor_ = declare_parameter("color_factor", 0.8);
+  const bool enable_profiling = declare_parameter("enable_profiling", false);
+  const std::string profiling_output_path =
+    declare_parameter("profiling_output_path", std::string(""));
+  const std::string profiling_run_name =
+    declare_parameter("profiling_run_name", std::string("run"));
+  const bool profiling_save_on_shutdown =
+    declare_parameter("profiling_save_on_shutdown", true);
+  const int profiling_discard_first_n =
+    declare_parameter("profiling_discard_first_n", 5);
+  profiler_ = std::make_unique<RuntimeProfiler>(
+    "octomap_server", "octomap_server", "octomap_server", enable_profiling,
+    profiling_output_path, profiling_run_name, profiling_save_on_shutdown,
+    profiling_discard_first_n);
 
   point_cloud_min_x_ = declare_parameter("point_cloud_min_x", -std::numeric_limits<double>::max());
   point_cloud_max_x_ = declare_parameter("point_cloud_max_x", std::numeric_limits<double>::max());
@@ -375,6 +605,8 @@ OctomapServer::OctomapServer(const rclcpp::NodeOptions & node_options)
   }
 }
 
+OctomapServer::~OctomapServer() = default;
+
 bool OctomapServer::openFile(const std::string & filename)
 {
   if (filename.length() <= 3) {
@@ -435,7 +667,7 @@ bool OctomapServer::openFile(const std::string & filename)
 
 void OctomapServer::insertCloudCallback(const PointCloud2::ConstSharedPtr cloud)
 {
-  const auto start_time = rclcpp::Clock{}.now();
+  const auto start_time = std::chrono::steady_clock::now();
 
   //
   // ground filtering in base frame
@@ -520,15 +752,30 @@ void OctomapServer::insertCloudCallback(const PointCloud2::ConstSharedPtr cloud)
 
   const auto & t = sensor_to_world_transform_stamped.transform.translation;
   tf2::Vector3 sensor_to_world_vec3{t.x, t.y, t.z};
+  const auto insert_scan_start = std::chrono::steady_clock::now();
   insertScan(sensor_to_world_vec3, pc_ground, pc_nonground);
+  profiler_->record(
+    "occupancy_integration_ms",
+    std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - insert_scan_start).count());
 
-  double total_elapsed = (rclcpp::Clock{}.now() - start_time).seconds();
+  double total_elapsed = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - start_time).count();
   RCLCPP_DEBUG(
     get_logger(),
     "Pointcloud insertion in OctomapServer done (%zu+%zu pts (ground/nonground), %f sec)",
     pc_ground.size(), pc_nonground.size(), total_elapsed);
 
+  const auto publish_start = std::chrono::steady_clock::now();
   publishAll(cloud->header.stamp);
+  profiler_->record(
+    "octomap_publish_all_ms",
+    std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - publish_start).count());
+  profiler_->record(
+    "octomap_callback_total_ms",
+    std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start_time).count());
 }
 
 void OctomapServer::insertScan(
@@ -661,7 +908,7 @@ void OctomapServer::insertScan(
 
 void OctomapServer::publishAll(const rclcpp::Time & rostime)
 {
-  const auto start_time = rclcpp::Clock{}.now();
+  const auto start_time = std::chrono::steady_clock::now();
   const size_t octomap_size = octree_->size();
   // TODO(someone): estimate num occ. voxels for size of arrays (reserve)
   if (octomap_size <= 1) {
@@ -909,7 +1156,8 @@ void OctomapServer::publishAll(const rclcpp::Time & rostime)
   if (publish_full_map) {
     publishFullOctoMap(rostime);
   }
-  double total_elapsed = (rclcpp::Clock{}.now() - start_time).seconds();
+  double total_elapsed = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - start_time).count();
   RCLCPP_DEBUG(get_logger(), "Map publishing in OctomapServer took %f sec", total_elapsed);
 }
 
@@ -917,7 +1165,7 @@ bool OctomapServer::onOctomapBinarySrv(
   [[maybe_unused]] const std::shared_ptr<OctomapSrv::Request> req,
   const std::shared_ptr<OctomapSrv::Response> res)
 {
-  const auto start_time = rclcpp::Clock{}.now();
+  const auto start_time = std::chrono::steady_clock::now();
   RCLCPP_INFO(get_logger(), "Sending binary map data on service request");
   res->map.header.frame_id = world_frame_id_;
   res->map.header.stamp = now();
@@ -925,7 +1173,8 @@ bool OctomapServer::onOctomapBinarySrv(
     return false;
   }
 
-  double total_elapsed = (rclcpp::Clock{}.now() - start_time).seconds();
+  double total_elapsed = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - start_time).count();
   RCLCPP_INFO(get_logger(), "Binary octomap sent in %f sec", total_elapsed);
   return true;
 }
